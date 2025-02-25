@@ -6,7 +6,7 @@ version: 1.4
 license: MIT
 description: A pipeline for generating text and processing images using the Anthropic API.
 requirements: requests, sseclient-py
-environment_variables: ANTHROPIC_API_KEY
+environment_variables: ANTHROPIC_API_KEY, ANTHROPIC_THINKING_BUDGET_TOKENS, ANTHROPIC_ENABLE_THINKING
 """
 
 import os
@@ -17,6 +17,14 @@ from pydantic import BaseModel
 import sseclient
 
 from utils.pipelines.main import pop_system_message
+
+REASONING_EFFORT_BUDGET_TOKEN_MAP = {
+    "none": None,
+    "low": 1024,
+    "medium": 4096,
+    "high": 16384,
+    "max": 32768,
+}
 
 
 class Pipeline:
@@ -29,7 +37,11 @@ class Pipeline:
         self.name = "anthropic/"
 
         self.valves = self.Valves(
-            **{"ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", "your-api-key-here")}
+            **{
+                "ANTHROPIC_API_KEY": os.getenv(
+                    "ANTHROPIC_API_KEY", "your-api-key-here"
+                ),
+            }
         )
         self.url = 'https://api.anthropic.com/v1/messages'
         self.update_headers()
@@ -139,6 +151,32 @@ class Pipeline:
             }
 
             if body.get("stream", False):
+                supports_thinking = "claude-3-7" in model_id
+                reasoning_effort = body.get("reasoning_effort", "none")
+                budget_tokens = REASONING_EFFORT_BUDGET_TOKEN_MAP.get(reasoning_effort)
+
+                # Allow users to input an integer value representing budget tokens
+                if (
+                    not budget_tokens
+                    and reasoning_effort not in REASONING_EFFORT_BUDGET_TOKEN_MAP.keys()
+                ):
+                    try:
+                        budget_tokens = int(reasoning_effort)
+                    except ValueError as e:
+                        print("Failed to convert reasoning effort to int", e)
+                        budget_tokens = None
+
+                if supports_thinking and budget_tokens:
+                    payload["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": budget_tokens,
+                    }
+                    # Thinking requires temperature 1.0 and does not support top_p, top_k
+                    payload["temperature"] = 1.0
+                    if "top_k" in payload:
+                        del payload["top_k"]
+                    if "top_p" in payload:
+                        del payload["top_p"]
                 return self.stream_response(payload)
             else:
                 return self.get_completion(payload)
@@ -147,6 +185,7 @@ class Pipeline:
 
     def stream_response(self, payload: dict) -> Generator:
         response = requests.post(self.url, headers=self.headers, json=payload, stream=True)
+        """Used for title and tag generation"""
 
         if response.status_code == 200:
             client = sseclient.SSEClient(response)
@@ -154,9 +193,17 @@ class Pipeline:
                 try:
                     data = json.loads(event.data)
                     if data["type"] == "content_block_start":
-                        yield data["content_block"]["text"]
+                        if data["content_block"]["type"] == "thinking":
+                            yield "<think>"
+                        else:
+                            yield data["content_block"]["text"]
                     elif data["type"] == "content_block_delta":
-                        yield data["delta"]["text"]
+                        if data["delta"]["type"] == "thinking_delta":
+                            yield data["delta"]["thinking"]
+                        elif data["delta"]["type"] == "signature_delta":
+                            yield "\n </think> \n\n"
+                        else:
+                            yield data["delta"]["text"]
                     elif data["type"] == "message_stop":
                         break
                 except json.JSONDecodeError:
@@ -171,6 +218,10 @@ class Pipeline:
         response = requests.post(self.url, headers=self.headers, json=payload)
         if response.status_code == 200:
             res = response.json()
-            return res["content"][0]["text"] if "content" in res and res["content"] else ""
+            for content in res["content"]:
+                if not content.get("text"):
+                    continue
+                return content["text"]
+            return ""
         else:
             raise Exception(f"Error: {response.status_code} - {response.text}")
